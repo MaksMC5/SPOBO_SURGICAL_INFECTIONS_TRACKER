@@ -1,0 +1,1624 @@
+/************************************************************
+ * SPREMLJANJE OKUŽBE KIRURŠKE RANE
+ * Google Sheets + Google Forms + Apps Script
+ *
+ * Spremljanje:
+ * dan 1, 7, 14, 30, 90 po operaciji
+ ************************************************************/
+
+const CONFIG = {
+
+  FOLLOW_UP_DAYS: [7, 14, 30, 90],
+
+  SEND_HOUR: 8,
+
+  SHEETS: {
+    PATIENTS: 'PACIENTI',
+    REMINDERS: 'OPOMNIKI',
+    RESPONSES: 'ODGOVORI',
+    SETTINGS: 'NASTAVITVE',
+    LOG: 'LOG'
+  },
+
+  REGISTRATION_FORM_TITLE:
+    'Spremljanje okužb kirurške rane – registracija po operaciji',
+
+  FOLLOWUP_FORM_PREFIX:
+    'Spremljanje okužb kirurške rane – ',
+
+  EMAIL_SUBJECT_PREFIX:
+    'Spremljanje kirurške rane – '
+};
+
+
+/************************************************************
+ * GLAVNA NAMESTITEV
+ ************************************************************/
+
+function setupSystem() {
+
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+
+  PropertiesService
+    .getScriptProperties()
+    .setProperty('SPREADSHEET_ID', ss.getId());
+
+  setupSheets_(ss);
+
+  const registrationForm = createRegistrationForm_();
+
+  const followupForms = {};
+
+  CONFIG.FOLLOW_UP_DAYS.forEach(day => {
+    followupForms[day] = createFollowupForm_(day);
+  });
+
+  saveSettings_(registrationForm, followupForms);
+
+  installTriggers_(registrationForm, followupForms);
+
+  SpreadsheetApp.getUi().alert(
+    'Sistem je uspešno ustvarjen.\n\n' +
+    'Ustvarjene so forme za dan 1, 7, 14, 30 in 90.\n\n' +
+    'V vsako dnevno formo moraš zdaj samo še ročno dodati vprašanje "File upload" za fotografijo kirurške rane.'
+  );
+}
+
+
+/************************************************************
+ * PRIDOBI GLAVNI SPREADSHEET
+ ************************************************************/
+
+function getSpreadsheet_() {
+
+  const id = PropertiesService
+    .getScriptProperties()
+    .getProperty('SPREADSHEET_ID');
+
+  if (!id) {
+    return SpreadsheetApp.getActiveSpreadsheet();
+  }
+
+  return SpreadsheetApp.openById(id);
+}
+
+
+/************************************************************
+ * USTVARI TABELE
+ ************************************************************/
+
+function setupSheets_(ss) {
+
+  const definitions = {
+
+    PACIENTI: [
+      'PatientID',
+      'Ime in priimek',
+      'Elektronska pošta',
+      'Telefon',
+      'Datum operacije',
+      'Terapija / antibiotik ob registraciji',
+      'Datum registracije',
+      'Status'
+    ],
+
+    OPOMNIKI: [
+      'PatientID',
+      'Ime in priimek',
+      'Elektronska pošta',
+      'Dan po operaciji',
+      'Datum opomnika',
+      'Poslano',
+      'Datum pošiljanja',
+      'Odgovorjeno',
+      'Datum odgovora',
+      'Povezava na formo'
+    ],
+
+    ODGOVORI: [
+      'Timestamp',
+      'PatientID',
+      'Dan po operaciji',
+
+      'Bolečina 0–10',
+      'Senzibiliteta 0–10',
+
+      'Oteklina',
+      'Rdečina',
+      'Vročina',
+      'Izcedek',
+      'Dehiscenca',
+
+      'Brez težav',
+
+      'Antibiotična terapija',
+      'Kateri antibiotik',
+
+      'Komentar',
+
+      'Fotografija'
+    ],
+
+    NASTAVITVE: [
+      'Nastavitev',
+      'Vrednost'
+    ],
+
+    LOG: [
+      'Timestamp',
+      'Dogodek',
+      'PatientID',
+      'Podrobnosti'
+    ]
+  };
+
+
+  Object.keys(definitions).forEach(name => {
+
+    let sheet = ss.getSheetByName(name);
+
+    if (!sheet) {
+      sheet = ss.insertSheet(name);
+    }
+
+    sheet.clear();
+
+    const headers = definitions[name];
+
+    sheet
+      .getRange(1, 1, 1, headers.length)
+      .setValues([headers])
+      .setFontWeight('bold')
+      .setBackground('#d9ead3')
+      .setHorizontalAlignment('center');
+
+    sheet.setFrozenRows(1);
+
+    sheet.autoResizeColumns(1, headers.length);
+
+    if (sheet.getFilter()) {
+      sheet.getFilter().remove();
+    }
+
+    sheet
+      .getRange(
+        1,
+        1,
+        Math.max(sheet.getMaxRows(), 2),
+        headers.length
+      )
+      .createFilter();
+  });
+
+
+  const patients = ss.getSheetByName('PACIENTI');
+  patients.setColumnWidth(1, 150);
+  patients.setColumnWidth(2, 200);
+  patients.setColumnWidth(3, 230);
+  patients.setColumnWidth(5, 130);
+
+  const reminders = ss.getSheetByName('OPOMNIKI');
+  reminders.setColumnWidth(1, 150);
+  reminders.setColumnWidth(2, 200);
+  reminders.setColumnWidth(3, 230);
+  reminders.setColumnWidth(5, 140);
+  reminders.setColumnWidth(10, 300);
+
+  const responses = ss.getSheetByName('ODGOVORI');
+  responses.setColumnWidth(1, 160);
+  responses.setColumnWidth(2, 150);
+  responses.setColumnWidth(14, 350);
+  responses.setColumnWidth(15, 300);
+}
+
+
+/************************************************************
+ * REGISTRACIJSKA FORMA
+ ************************************************************/
+
+function createRegistrationForm_() {
+
+  const form = FormApp.create(
+    CONFIG.REGISTRATION_FORM_TITLE
+  );
+
+  form.setDescription(
+    'Ta obrazec je namenjen registraciji po operaciji. ' +
+    'Po oddaji boste 1., 7., 14., 30. in 90. dan po operaciji ' +
+    'po elektronski pošti prejeli kratek vprašalnik o stanju kirurške rane.'
+  );
+
+  form.setConfirmationMessage(
+    'Hvala. Registracija je bila uspešno oddana. ' +
+    'Na določene dni po operaciji boste prejeli elektronsko sporočilo z vprašalnikom.'
+  );
+
+
+  form
+    .addTextItem()
+    .setTitle('Ime in priimek')
+    .setRequired(true);
+
+
+  form
+    .addTextItem()
+    .setTitle('Elektronska pošta')
+    .setHelpText(
+      'Na ta naslov boste prejeli vprašalnike za spremljanje kirurške rane.'
+    )
+    .setRequired(true);
+
+
+  form
+    .addTextItem()
+    .setTitle('Telefon')
+    .setHelpText(
+      'Če obrazec izpolnjuje skrbnik otroka, vpišite telefonsko številko skrbnika.'
+    )
+    .setRequired(true);
+
+
+  form
+    .addDateItem()
+    .setTitle('Datum operacije')
+    .setRequired(true);
+
+
+  form
+    .addMultipleChoiceItem()
+    .setTitle('Ali trenutno jemljete antibiotično terapijo?')
+    .setChoiceValues([
+      'Da',
+      'Ne'
+    ])
+    .setRequired(true);
+
+
+  form
+    .addTextItem()
+    .setTitle('Če jemljete antibiotik, katerega?')
+    .setHelpText(
+      'Če antibiotika ne jemljete, lahko pustite prazno.'
+    );
+
+
+  return form;
+}
+
+
+/************************************************************
+ * DNEVNE FORME
+ ************************************************************/
+
+function createFollowupForm_(day) {
+
+  const form = FormApp.create(
+    CONFIG.FOLLOWUP_FORM_PREFIX +
+    day +
+    '. dan po operaciji'
+  );
+
+
+  form.setDescription(
+    'Danes je ' +
+    day +
+    '. dan po operaciji.\n\n' +
+    'Prosimo, odgovorite na vprašanja o trenutnem stanju kirurške rane. ' +
+    'Vprašalnik je namenjen spremljanju celjenja in morebitnih znakov okužbe.'
+  );
+
+
+  form.setConfirmationMessage(
+    'Hvala. Vaš odgovor je bil uspešno oddan.'
+  );
+
+
+  /***********************
+   * PATIENT ID
+   ***********************/
+
+  form
+    .addTextItem()
+    .setTitle('PatientID')
+    .setHelpText(
+      'To polje je izpolnjeno samodejno. Prosimo, ne spreminjajte ga.'
+    )
+    .setRequired(true);
+
+
+  /***********************
+   * BOLEČINA
+   ***********************/
+
+  form
+    .addScaleItem()
+    .setTitle(
+      'Kako močna je trenutno bolečina v področju kirurške rane?'
+    )
+    .setBounds(0, 10)
+    .setLabels(
+      '0 – brez bolečine',
+      '10 – najhujša možna bolečina'
+    )
+    .setRequired(true);
+
+
+  /***********************
+   * SENZIBILITETA
+   ***********************/
+
+  form
+    .addScaleItem()
+    .setTitle(
+      'Kako ocenjujete občutek oziroma senzibiliteto v področju kirurške rane?'
+    )
+    .setHelpText(
+      'Ocenite morebitno mravljinčenje, zmanjšan občutek, omrtvelost ali druge spremembe zaznavanja.'
+    )
+    .setBounds(0, 10)
+    .setLabels(
+      '0 – občutka ni',
+      '10 – normalen občutek'
+    )
+    .setRequired(true);
+
+
+  /***********************
+   * STANJE RANE
+   ***********************/
+
+  form
+    .addSectionHeaderItem()
+    .setTitle('Stanje kirurške rane')
+    .setHelpText(
+      'Odgovorite na naslednja vprašanja glede trenutnega stanja rane.'
+    );
+
+
+  form
+    .addMultipleChoiceItem()
+    .setTitle(
+      'Ali opažate oteklino v področju kirurške rane?'
+    )
+    .setChoiceValues([
+      'Ne',
+      'Da – blaga',
+      'Da – zmerna',
+      'Da – izrazita'
+    ])
+    .setRequired(true);
+
+
+  form
+    .addMultipleChoiceItem()
+    .setTitle(
+      'Ali opažate rdečino v okolici kirurške rane?'
+    )
+    .setChoiceValues([
+      'Ne',
+      'Da – blaga',
+      'Da – izrazita'
+    ])
+    .setRequired(true);
+
+
+  form
+    .addMultipleChoiceItem()
+    .setTitle(
+      'Ali imate povišano telesno temperaturo oziroma vročino?'
+    )
+    .setChoiceValues([
+      'Ne',
+      'Da – do 38 °C',
+      'Da – nad 38 °C'
+    ])
+    .setRequired(true);
+
+
+  form
+    .addMultipleChoiceItem()
+    .setTitle(
+      'Ali opažate izcedek iz kirurške rane?'
+    )
+    .setChoiceValues([
+      'Ne',
+      'Da – prozoren',
+      'Da – krvavkast',
+      'Da – rumenkast ali gnojen',
+      'Da – izcedek neprijetnega vonja'
+    ])
+    .setRequired(true);
+
+
+  form
+    .addMultipleChoiceItem()
+    .setTitle(
+      'Ali opažate razprtje kirurške rane oziroma kirurških šivov – dehiscenco?'
+    )
+    .setChoiceValues([
+      'Ne',
+      'Da – manjše razprtje',
+      'Da – izrazitejše razprtje'
+    ])
+    .setRequired(true);
+
+
+  form
+    .addMultipleChoiceItem()
+    .setTitle(
+      'Ali imate trenutno glede kirurške rane kakršne koli težave?'
+    )
+    .setChoiceValues([
+      'Ne – brez težav',
+      'Da'
+    ])
+    .setRequired(true);
+
+
+  /***********************
+   * ANTIBIOTIK
+   ***********************/
+
+  form
+    .addSectionHeaderItem()
+    .setTitle('Antibiotična terapija');
+
+
+  form
+    .addMultipleChoiceItem()
+    .setTitle(
+      'Ali trenutno jemljete antibiotično terapijo?'
+    )
+    .setChoiceValues([
+      'Da',
+      'Ne'
+    ])
+    .setRequired(true);
+
+
+  form
+    .addTextItem()
+    .setTitle(
+      'Če jemljete antibiotik, katerega?'
+    )
+    .setHelpText(
+      'Če antibiotika ne jemljete, pustite prazno.'
+    );
+
+
+  /***********************
+   * KOMENTAR
+   ***********************/
+
+  form
+    .addParagraphTextItem()
+    .setTitle(
+      'Želite o stanju rane še kaj dodati? Imate kakšno vprašanje?'
+    )
+    .setHelpText(
+      'Sem lahko zapišete dodatne težave, opažanja ali vprašanja.'
+    );
+
+
+  /***********************
+   * FOTOGRAFIJA
+   ***********************/
+
+  form
+    .addSectionHeaderItem()
+    .setTitle('Fotografija kirurške rane')
+    .setHelpText(
+      'Prosimo, dodajte fotografijo kirurške rane. ' +
+      'Po ustvarjanju forme mora administrator tukaj ročno dodati vprašanje tipa File upload z naslovom: "Fotografija kirurške rane".'
+    );
+
+
+  return form;
+}
+
+
+/************************************************************
+ * SHRANI NASTAVITVE
+ ************************************************************/
+
+function saveSettings_(registrationForm, followupForms) {
+
+  const sheet = getSpreadsheet_()
+    .getSheetByName(CONFIG.SHEETS.SETTINGS);
+
+  const rows = [
+
+    [
+      'REGISTRATION_FORM_ID',
+      registrationForm.getId()
+    ],
+
+    [
+      'REGISTRATION_FORM_URL',
+      registrationForm.getPublishedUrl()
+    ],
+
+    [
+      'REGISTRATION_FORM_EDIT_URL',
+      registrationForm.getEditUrl()
+    ]
+  ];
+
+
+  CONFIG.FOLLOW_UP_DAYS.forEach(day => {
+
+    rows.push([
+      'FORM_' + day + '_ID',
+      followupForms[day].getId()
+    ]);
+
+    rows.push([
+      'FORM_' + day + '_URL',
+      followupForms[day].getPublishedUrl()
+    ]);
+
+    rows.push([
+      'FORM_' + day + '_EDIT_URL',
+      followupForms[day].getEditUrl()
+    ]);
+  });
+
+
+  sheet
+    .getRange(
+      2,
+      1,
+      rows.length,
+      2
+    )
+    .setValues(rows);
+}
+
+
+/************************************************************
+ * TRIGGERJI
+ ************************************************************/
+
+function installTriggers_(registrationForm, followupForms) {
+
+  const oldTriggers = ScriptApp.getProjectTriggers();
+
+
+  oldTriggers.forEach(trigger => {
+
+    const handler = trigger.getHandlerFunction();
+
+    if (
+      handler === 'onRegistrationSubmit' ||
+      handler === 'onFollowupSubmit' ||
+      handler === 'sendDailyReminders'
+    ) {
+
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+
+  /***********************
+   * REGISTRACIJA
+   ***********************/
+
+  ScriptApp
+    .newTrigger('onRegistrationSubmit')
+    .forForm(registrationForm)
+    .onFormSubmit()
+    .create();
+
+
+  /***********************
+   * DNEVNE FORME
+   ***********************/
+
+  CONFIG.FOLLOW_UP_DAYS.forEach(day => {
+
+    ScriptApp
+      .newTrigger('onFollowupSubmit')
+      .forForm(followupForms[day])
+      .onFormSubmit()
+      .create();
+  });
+
+
+  /***********************
+   * DNEVNI MAILI
+   ***********************/
+
+  ScriptApp
+    .newTrigger('sendDailyReminders')
+    .timeBased()
+    .everyDays(1)
+    .atHour(CONFIG.SEND_HOUR)
+    .create();
+}
+
+
+/************************************************************
+ * OB REGISTRACIJI PACIENTA
+ ************************************************************/
+
+function onRegistrationSubmit(e) {
+
+  try {
+
+    const data = formResponseToObject_(e.response);
+
+    const patientId = createPatientId_();
+
+    const name =
+      data['Ime in priimek'];
+
+    const email =
+      data['Elektronska pošta'];
+
+    const phone =
+      data['Telefon'];
+
+    const surgeryDate =
+      new Date(data['Datum operacije']);
+
+    const antibiotics =
+      data['Ali trenutno jemljete antibiotično terapijo?'];
+
+    const antibioticName =
+      data['Če jemljete antibiotik, katerega?'] || '';
+
+
+    const therapy =
+      antibiotics === 'Da'
+        ? antibioticName || 'Da'
+        : 'Ne';
+
+
+    const ss = getSpreadsheet_();
+
+
+    /***********************
+     * PACIENT
+     ***********************/
+
+    ss
+      .getSheetByName(CONFIG.SHEETS.PATIENTS)
+      .appendRow([
+        patientId,
+        name,
+        email,
+        phone,
+        surgeryDate,
+        therapy,
+        new Date(),
+        'Aktiven'
+      ]);
+
+
+    /***********************
+     * OPOMNIKI
+     ***********************/
+
+    const reminderSheet =
+      ss.getSheetByName(CONFIG.SHEETS.REMINDERS);
+
+
+    CONFIG.FOLLOW_UP_DAYS.forEach(day => {
+
+      const reminderDate =
+        addDays_(surgeryDate, day);
+
+      const form =
+        getFollowupForm_(day);
+
+      const url =
+        createPrefilledUrl_(
+          form,
+          patientId
+        );
+
+
+      reminderSheet.appendRow([
+        patientId,
+        name,
+        email,
+        day,
+        reminderDate,
+        false,
+        '',
+        false,
+        '',
+        url
+      ]);
+
+    });
+
+
+    /***********************
+     * POTRDITVENI MAIL
+     ***********************/
+
+    sendRegistrationConfirmation_(
+      name,
+      email
+    );
+
+
+    log_(
+      'REGISTRACIJA',
+      patientId,
+      'Pacient uspešno registriran.'
+    );
+
+
+  } catch (error) {
+
+    log_(
+      'NAPAKA REGISTRACIJE',
+      '',
+      error.stack || error.toString()
+    );
+
+    throw error;
+  }
+}
+
+
+/************************************************************
+ * ODGOVORE IZ FORME PRETVORI V OBJEKT
+ ************************************************************/
+
+function formResponseToObject_(response) {
+
+  const data = {};
+
+  response.getItemResponses().forEach(itemResponse => {
+
+    const title =
+      itemResponse.getItem().getTitle();
+
+    data[title] =
+      itemResponse.getResponse();
+  });
+
+  return data;
+}
+
+
+/************************************************************
+ * PERSONALIZIRANA POVEZAVA
+ ************************************************************/
+
+function createPrefilledUrl_(form, patientId) {
+
+  const patientItem =
+    form
+      .getItems(FormApp.ItemType.TEXT)
+      .map(item => item.asTextItem())
+      .find(item =>
+        item.getTitle() === 'PatientID'
+      );
+
+
+  if (!patientItem) {
+
+    throw new Error(
+      'V formi ni vprašanja PatientID.'
+    );
+  }
+
+
+  const response =
+    form.createResponse();
+
+
+  response.withItemResponse(
+    patientItem.createResponse(patientId)
+  );
+
+
+  return response.toPrefilledUrl();
+}
+
+
+/************************************************************
+ * DNEVNO POŠILJANJE MAILOV
+ ************************************************************/
+
+function sendDailyReminders() {
+
+  const ss = getSpreadsheet_();
+
+  const sheet =
+    ss.getSheetByName(CONFIG.SHEETS.REMINDERS);
+
+  const lastRow =
+    sheet.getLastRow();
+
+
+  if (lastRow < 2) {
+    return;
+  }
+
+
+  const values =
+    sheet
+      .getRange(
+        2,
+        1,
+        lastRow - 1,
+        10
+      )
+      .getValues();
+
+
+  const today =
+    stripTime_(new Date());
+
+
+  values.forEach((row, index) => {
+
+    const patientId = row[0];
+
+    const name = row[1];
+
+    const email = row[2];
+
+    const day = Number(row[3]);
+
+    const reminderDate =
+      stripTime_(new Date(row[4]));
+
+    const sent =
+      row[5] === true;
+
+    const answered =
+      row[7] === true;
+
+    const formUrl =
+      row[9];
+
+
+    if (
+      reminderDate.getTime() <= today.getTime() &&
+      !sent &&
+      !answered
+    ) {
+
+      try {
+
+        sendFollowupEmail_(
+          name,
+          email,
+          day,
+          formUrl
+        );
+
+
+        const rowNumber =
+          index + 2;
+
+
+        sheet
+          .getRange(rowNumber, 6)
+          .setValue(true);
+
+
+        sheet
+          .getRange(rowNumber, 7)
+          .setValue(new Date());
+
+
+        log_(
+          'OPOMNIK POSLAN',
+          patientId,
+          'Dan ' + day
+        );
+
+
+      } catch (error) {
+
+        log_(
+          'NAPAKA PRI POŠILJANJU',
+          patientId,
+          'Dan ' +
+          day +
+          ': ' +
+          error.toString()
+        );
+      }
+    }
+  });
+}
+
+
+/************************************************************
+ * POTRDITVENI MAIL
+ ************************************************************/
+
+function sendRegistrationConfirmation_(name, email) {
+
+  const subject =
+    'Registracija uspešna – spremljanje kirurške rane';
+
+
+  const html = `
+
+  <div style="
+      font-family:Arial,sans-serif;
+      max-width:650px;
+      margin:auto;
+      line-height:1.6;
+      font-size:16px;
+  ">
+
+    <h2>
+      Spremljanje kirurške rane
+    </h2>
+
+    <p>
+      Pozdravljeni ${escapeHtml_(name)},
+    </p>
+
+    <p>
+      vaša registracija v sistem za spremljanje
+      kirurške rane je bila uspešna.
+    </p>
+
+    <p>
+      Vprašalnike boste prejeli
+      <strong>
+        1., 7., 14., 30. in 90. dan po operaciji.
+      </strong>
+    </p>
+
+    <p>
+      Na dan spremljanja boste po elektronski
+      pošti prejeli neposredno povezavo do
+      vprašalnika.
+    </p>
+
+    <p>
+      Prosimo, da vprašalnik izpolnite čim prej
+      po prejemu.
+    </p>
+
+    <p>
+      Hvala za sodelovanje.
+    </p>
+
+  </div>
+  `;
+
+
+  GmailApp.sendEmail(
+    email,
+    subject,
+    'Vaša registracija je bila uspešna.',
+    {
+      htmlBody: html
+    }
+  );
+}
+
+
+/************************************************************
+ * MAIL ZA POSAMEZEN DAN
+ ************************************************************/
+
+function sendFollowupEmail_(name, email, day, url) {
+
+  const subject =
+    CONFIG.EMAIL_SUBJECT_PREFIX +
+    day +
+    '. dan po operaciji';
+
+
+  const html = `
+
+  <div style="
+      font-family:Arial,sans-serif;
+      max-width:650px;
+      margin:auto;
+      line-height:1.6;
+      font-size:16px;
+  ">
+
+    <h2>
+      Spremljanje kirurške rane
+    </h2>
+
+    <p>
+      Pozdravljeni ${escapeHtml_(name)},
+    </p>
+
+    <p>
+      danes je
+      <strong>
+        ${day}. dan po vaši operaciji.
+      </strong>
+    </p>
+
+    <p>
+      Prosimo, da izpolnite kratek vprašalnik
+      o trenutnem stanju kirurške rane.
+    </p>
+
+    <p>
+      V vprašalniku vas bomo vprašali o bolečini,
+      občutku v področju rane, oteklini, rdečini,
+      morebitnem izcedku in drugih znakih celjenja.
+    </p>
+
+    <p style="
+        margin-top:30px;
+        margin-bottom:30px;
+    ">
+
+      <a
+        href="${url}"
+        style="
+          display:inline-block;
+          background:#188038;
+          color:#ffffff;
+          padding:15px 28px;
+          text-decoration:none;
+          border-radius:6px;
+          font-weight:bold;
+        "
+      >
+        IZPOLNI VPRAŠALNIK
+      </a>
+
+    </p>
+
+    <p>
+      Izpolnjevanje traja le nekaj minut.
+    </p>
+
+    <p>
+      Hvala za sodelovanje.
+    </p>
+
+  </div>
+  `;
+
+
+  GmailApp.sendEmail(
+    email,
+    subject,
+    'Vprašalnik: ' + url,
+    {
+      htmlBody: html
+    }
+  );
+}
+
+
+/************************************************************
+ * OB ODDAJI DNEVNE FORME
+ ************************************************************/
+
+function onFollowupSubmit(e) {
+
+  try {
+
+    const form =
+      e.source;
+
+    const response =
+      e.response;
+
+    const data =
+      formResponseToObject_(response);
+
+
+    const patientId =
+      data['PatientID'];
+
+    const day = getDayFromForm_(form);
+
+
+    const photo =
+      getPhotoResponse_(response);
+
+
+    const responseSheet =
+      getSpreadsheet_()
+        .getSheetByName(
+          CONFIG.SHEETS.RESPONSES
+        );
+
+
+    responseSheet.appendRow([
+
+      new Date(),
+
+      patientId,
+
+      day,
+
+      data[
+        'Kako močna je trenutno bolečina v področju kirurške rane?'
+      ] || '',
+
+      data[
+        'Kako ocenjujete občutek oziroma senzibiliteto v področju kirurške rane?'
+      ] || '',
+
+      data[
+        'Ali opažate oteklino v področju kirurške rane?'
+      ] || '',
+
+      data[
+        'Ali opažate rdečino v okolici kirurške rane?'
+      ] || '',
+
+      data[
+        'Ali imate povišano telesno temperaturo oziroma vročino?'
+      ] || '',
+
+      data[
+        'Ali opažate izcedek iz kirurške rane?'
+      ] || '',
+
+      data[
+        'Ali opažate razprtje kirurške rane oziroma kirurških šivov – dehiscenco?'
+      ] || '',
+
+      data[
+        'Ali imate trenutno glede kirurške rane kakršne koli težave?'
+      ] || '',
+
+      data[
+        'Ali trenutno jemljete antibiotično terapijo?'
+      ] || '',
+
+      data[
+        'Če jemljete antibiotik, katerega?'
+      ] || '',
+
+      data[
+        'Želite o stanju rane še kaj dodati? Imate kakšno vprašanje?'
+      ] || '',
+
+      photo
+
+    ]);
+
+
+    markReminderAnswered_(
+      patientId,
+      day
+    );
+
+
+    log_(
+      'ODGOVOR PREJET',
+      patientId,
+      'Dan ' + day
+    );
+
+
+  } catch (error) {
+
+    log_(
+      'NAPAKA ODGOVORA',
+      '',
+      error.stack || error.toString()
+    );
+
+    throw error;
+  }
+}
+
+
+/************************************************************
+ * POSKUS PRIDOBITVE FOTOGRAFIJE
+ ************************************************************/
+
+function getPhotoResponse_(response) {
+
+  const responses =
+    response.getItemResponses();
+
+
+  for (let i = 0; i < responses.length; i++) {
+
+    const itemResponse =
+      responses[i];
+
+    const item =
+      itemResponse.getItem();
+
+
+    if (
+      item.getTitle() === 'Fotografija kirurške rane'
+    ) {
+
+      const value =
+        itemResponse.getResponse();
+
+
+      if (Array.isArray(value)) {
+
+        return value
+          .map(fileId => {
+            return 'https://drive.google.com/open?id=' + fileId;
+          })
+          .join(', ');
+      }
+
+
+      return String(value || '');
+    }
+  }
+
+
+  return '';
+}
+
+
+/************************************************************
+ * OZNAČI, DA JE ODGOVOR PREJET
+ ************************************************************/
+
+function markReminderAnswered_(patientId, day) {
+
+  const sheet =
+    getSpreadsheet_()
+      .getSheetByName(
+        CONFIG.SHEETS.REMINDERS
+      );
+
+
+  const lastRow =
+    sheet.getLastRow();
+
+
+  if (lastRow < 2) {
+    return;
+  }
+
+
+  const rows =
+    sheet
+      .getRange(
+        2,
+        1,
+        lastRow - 1,
+        10
+      )
+      .getValues();
+
+
+  for (let i = 0; i < rows.length; i++) {
+
+    const id =
+      rows[i][0];
+
+    const reminderDay =
+      Number(rows[i][3]);
+
+
+    if (
+      id === patientId &&
+      reminderDay === Number(day)
+    ) {
+
+      sheet
+        .getRange(i + 2, 8)
+        .setValue(true);
+
+
+      sheet
+        .getRange(i + 2, 9)
+        .setValue(new Date());
+
+
+      return;
+    }
+  }
+}
+
+
+/************************************************************
+ * PRIDOBI FORMO ZA DAN
+ ************************************************************/
+
+function getFollowupForm_(day) {
+
+  const settings =
+    getSettings_();
+
+
+  const id =
+    settings[
+      'FORM_' + day + '_ID'
+    ];
+
+
+  if (!id) {
+
+    throw new Error(
+      'Form ID za dan ' +
+      day +
+      ' ni nastavljen.'
+    );
+  }
+
+
+  return FormApp.openById(id);
+}
+
+
+/************************************************************
+ * SETTINGS
+ ************************************************************/
+
+function getSettings_() {
+
+  const sheet =
+    getSpreadsheet_()
+      .getSheetByName(
+        CONFIG.SHEETS.SETTINGS
+      );
+
+
+  const result = {};
+
+
+  if (!sheet) {
+    return result;
+  }
+
+
+  const lastRow =
+    sheet.getLastRow();
+
+
+  if (lastRow < 2) {
+    return result;
+  }
+
+
+  sheet
+    .getRange(
+      2,
+      1,
+      lastRow - 1,
+      2
+    )
+    .getValues()
+    .forEach(row => {
+
+      if (row[0]) {
+        result[row[0]] = row[1];
+      }
+    });
+
+
+  return result;
+}
+
+
+/************************************************************
+ * PATIENT ID
+ ************************************************************/
+
+function createPatientId_() {
+
+  return (
+    'P-' +
+    Utilities
+      .getUuid()
+      .replace(/-/g, '')
+      .substring(0, 10)
+      .toUpperCase()
+  );
+}
+
+
+/************************************************************
+ * DATUMI
+ ************************************************************/
+
+function addDays_(date, days) {
+
+  const result =
+    new Date(date);
+
+  result.setDate(
+    result.getDate() + days
+  );
+
+  return result;
+}
+
+
+function stripTime_(date) {
+
+  return new Date(
+    date.getFullYear(),
+    date.getMonth(),
+    date.getDate()
+  );
+}
+
+
+/************************************************************
+ * PREPOZNA DAN IZ NASLOVA FORME
+ ************************************************************/
+
+function getDayFromForm_(form) {
+
+  const formId = form.getId();
+  const settings = getSettings_();
+
+  for (const day of CONFIG.FOLLOW_UP_DAYS) {
+
+    if (settings['FORM_' + day + '_ID'] === formId) {
+      return day;
+    }
+
+  }
+
+  throw new Error(
+    'Iz ID-ja forme ni mogoče ugotoviti dneva. Form ID: ' + formId
+  );
+}
+
+
+/*
+ * Stara funkcija ostane samo zaradi kompatibilnosti,
+ * vendar je pri novih odgovorih ne uporabljamo več.
+ */
+function extractDayFromFormTitle_(title) {
+
+  const match = String(title).match(/(\d+)\.\s*dan/i);
+
+  if (!match) {
+    throw new Error(
+      'Iz naslova forme ni mogoče ugotoviti dneva: ' + title
+    );
+  }
+
+  return Number(match[1]);
+}
+
+
+/************************************************************
+ * LOG
+ ************************************************************/
+
+function log_(event, patientId, details) {
+
+  try {
+
+    const sheet =
+      getSpreadsheet_()
+        .getSheetByName(
+          CONFIG.SHEETS.LOG
+        );
+
+
+    sheet.appendRow([
+      new Date(),
+      event,
+      patientId,
+      details
+    ]);
+
+
+  } catch (error) {
+
+    console.error(
+      event,
+      patientId,
+      details,
+      error
+    );
+  }
+}
+
+
+/************************************************************
+ * HTML ESCAPE
+ ************************************************************/
+
+function escapeHtml_(text) {
+
+  if (
+    text === null ||
+    text === undefined
+  ) {
+    return '';
+  }
+
+
+  return String(text)
+
+    .replace(/&/g, '&amp;')
+
+    .replace(/</g, '&lt;')
+
+    .replace(/>/g, '&gt;')
+
+    .replace(/"/g, '&quot;')
+
+    .replace(/'/g, '&#039;');
+}
+
+
+/************************************************************
+ * MENI V GOOGLE SHEETU
+ ************************************************************/
+
+function onOpen() {
+
+  SpreadsheetApp
+    .getUi()
+    .createMenu(
+      'Spremljanje rane'
+    )
+
+    .addItem(
+      'Namesti sistem',
+      'setupSystem'
+    )
+
+    .addSeparator()
+
+    .addItem(
+      'Pošlji današnje opomnike',
+      'sendDailyReminders'
+    )
+
+    .addSeparator()
+
+    .addItem(
+      'Pokaži povezave do form',
+      'showFormLinks'
+    )
+
+    .addToUi();
+}
+
+
+/************************************************************
+ * POKAŽI VSE FORME
+ ************************************************************/
+
+function showFormLinks() {
+
+  const settings =
+    getSettings_();
+
+
+  let message =
+    'REGISTRACIJA:\n' +
+    (settings.REGISTRATION_FORM_EDIT_URL || '') +
+    '\n\n';
+
+
+  CONFIG.FOLLOW_UP_DAYS.forEach(day => {
+
+    message +=
+      'DAN ' +
+      day +
+      ':\n' +
+      (
+        settings[
+          'FORM_' +
+          day +
+          '_EDIT_URL'
+        ] || ''
+      ) +
+      '\n\n';
+  });
+
+
+  SpreadsheetApp
+    .getUi()
+    .alert(message);
+}
